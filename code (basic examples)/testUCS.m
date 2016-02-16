@@ -1,4 +1,4 @@
-function testUCS
+cdfunction testUCS
 % Sparsification Examples for Unweighted Column Selection
 % David G. Anderson
 % 2015
