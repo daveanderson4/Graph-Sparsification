@@ -73,33 +73,44 @@ int main(int argc, char* argv[]) {
   bool root = (rank == 0);
 
   // declare parameters
-  int n, k, l;
-  double lambda, slambda, lambda_hat, slambdah;
-  bool VERBOSE, WRITE;
-  char UPLO;
-  int INFO;
-  double *space, *A, *U, *Ainv;
-  int *pi, *pi2;
-  double T;
-  int mindx;
-  double trinv=0, trhinv=0;
-  solver *s1;
-  bisection b1;
-  bool record = true;
-  double seconds;
+  int 		n, 	k, 	l, 	INFO, 	*pi, 	*pi2;
+  double 	lambda, slambda, 	lambda_hat, 	slambdah, 
+		T, 	seconds, 	trinv=0, 	trhinv=0, 
+		*A, 	*Ainv, 	*U, 	*space;
+  bool 		VERBOSE, 	WRITE, 	record=true;
+  char 		UPLO;
+  solver 	*s1;
+  bisection	b1;
 
-  // parameters
-  n = 73;
-  k = 35;
-  l = 2*k;
+  // set parameters
+  assert (argc > 2); // must specify problem size
   if (argc > 3) {
     n = atoi(argv[1]);
     k = atoi(argv[2]);
-    l = atoi(argv[3]);
+    if (argc > 3) {
+      l = atoi(argv[3]);
+    }
+    else l = k+1; // default to minimum spanning tree
   }
   sparsifier S(n, k, l);
   T = S.getT();
 
+  // find bound on search indices for processor
+  int start  = n/size*rank;      	// inclusive
+  int finish = n/size*(rank+1); 	// exclusive
+  if (rank == size-1) finish = n;	// corner case
+  int n_local = finish-start;
+
+  // allocate space
+  U = new double[n_local*k];
+
+  double* U_dest;
+  if (rank != 0) {
+    U_dest = new double[n_local*k];
+  }
+
+  // sequential parts of this algorithm will be calculated on the root
+  // setup information for the root here
   if (root) {
     VERBOSE = false;
     WRITE   = true;
@@ -108,23 +119,38 @@ int main(int argc, char* argv[]) {
     ifstream fin;
     fin.open ("U.txt");
     assert(fin);
-    U = new double[n*k];
-    for (int i=0; i<n; ++i) {
+
+    // load data for root
+    for (int i=0; i<n_local; ++i) {
       for (int j=0; j<k; ++j) {
-        fin >> U[i+n*j];
+        fin >> U[i+n_local*j];
       }
+    }
+
+    // read and send data for each core
+    for (int core=1; core<size; ++core) {
+      int dest_start = n/size*core;
+      int dest_finish = n/size*(core+1);
+      if (core == size-1) dest_finish = n;
+      int n_dest = dest_finish - dest_start;
+      U_dest = new double[n_dest*k];
+      for (int i=0; i<n_dest; ++i) {
+        for (int j=0; j<k; ++j) {
+          fin >> U_dest[i+n_dest*j];
+        }
+      }
+      MPI_Send(&U_dest[0], n_dest*k, MPI_DOUBLE, core, 0, MPI_COMM_WORLD);
     }
     fin.close();
 
     // begin timer here
-    if (root) seconds = read_timer();
+    seconds = read_timer();
 
     pi = new int[n];
     for (int i=0; i<n; ++i) { pi[i] = 0; }
   
-    lambda     = -1e308;//-DBL_MAX; // smallest double
-    lambda_hat = -1e308;//-DBL_MAX;
-    mindx = -1;
+    lambda     = -DBL_MAX; // smallest double
+    lambda_hat = -DBL_MAX;
 
     double lbond3 = -(double)n/T;
     UPLO = 'N';
@@ -137,16 +163,17 @@ int main(int argc, char* argv[]) {
     slambda=lambda;
     slambdah = lambda_hat;
   } // ends if(root)
+  else {
+    // receive data if not root
+    MPI_Status recv_status;
+    MPI_Recv(&U[0], n_local*k, MPI_DOUBLE, 0, 0, MPI_COMM_WORLD, &recv_status);
 
-  // all processors need (part) of U
-  if (!root) U = new double[n*k];
-  MPI_Bcast(U,  n*k, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-  MPI_Barrier(MPI_COMM_WORLD);
+  } // data has been sent out
 
   // iterate
   for (int r=0; r<l; ++r) {
 
-    // perform easy calculations on root only
+    // perform easy/sequential calculations on root only
     if (root) {
 
       // superfluous send on previous iteration causes a blank pass through
@@ -155,13 +182,13 @@ int main(int argc, char* argv[]) {
         lambda = slambda;
         lambda_hat = slambdah;
         char    NO = 'N';
+        int     LWORK = 20*k; // LWORK >= (NB+2)*k optimally
+        int     ONEINT = 1;
         double* Acopy = new double[k*k]; // eigenvalue routine destroys matrix
         double* s     = new double[k];
         double* WI    = new double[k];
-        int     LWORK = 20*k; // LWORK >= (NB+2)*k optimally
         double* WORK  = new double[LWORK];
         double *VL, *VR;
-        int     ONEINT = 1;
         dlacpy_(&UPLO, &k, &k, A, &k, Acopy, &k);
 
         char UP = 'U'; // both parts are stored in this implementation
@@ -169,10 +196,10 @@ int main(int argc, char* argv[]) {
         int* IWORK = new int[LIWORK];
 
         dsyevd_(&NO, &UP, &k, Acopy, &k, s, WORK, &LWORK, IWORK, &LIWORK, &INFO);
-        delete IWORK;
-        delete Acopy;
-        delete WI;
-        delete WORK;
+        delete[] IWORK;
+        delete[] Acopy;
+        delete[] WI;
+        delete[] WORK;
 
         double mins = max(s[0], 0.); // dsyev reports eigenvalues in ascending order
         double r1_lb = max(lambda_hat, mins-1);
@@ -201,7 +228,7 @@ int main(int argc, char* argv[]) {
           trinv  += 1/(s[i] - lambda);
           trhinv += 1/(s[i] - lambda_hat);
         }
-        delete s;
+        delete[] s;
 
         Ainv = new double[k*k];
         dlacpy_(&UPLO, &k, &k, A, &k, Ainv, &k);
@@ -213,93 +240,92 @@ int main(int argc, char* argv[]) {
 
     // other cores need to allocate space
     if (!root) {
-      Ainv = new double[k*k];
+      Ainv  = new double[k*k];
       space = new double[k];
-      pi = new int[n];
+      pi    = new int[n];
     }
 
     // send variables out to other cores
-    MPI_Barrier(MPI_COMM_WORLD);
     MPI_Bcast(Ainv,  k*k, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     MPI_Bcast(&trinv,  1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     MPI_Bcast(&trhinv, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     MPI_Bcast(pi,      n, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Barrier(MPI_COMM_WORLD);
 
     // begin unblocked receive
     int fcol;
     MPI_Status status;
     MPI_Request request;
-    MPI_Irecv(&fcol, 1, MPI_INT, MPI_ANY_SOURCE, 1, MPI_COMM_WORLD, &request);
+
+    // data to contain found vector, which will need to be sent from the core that found it
+    // to the root
+    // u_vec contains the selected column, with an additional entry indicating the location
+    // of the found column
+    double* u_vec;
+    u_vec = new double[k+1];
+
+    // non blocking receive
+    MPI_Irecv(&u_vec[0], k+1, MPI_DOUBLE, MPI_ANY_SOURCE, 1, MPI_COMM_WORLD, &request);
 
     // test if done already
     int done = 0;
     MPI_Test(&request, &done, &status);
-    
-    // find bound on search indices for processor
-    int start  = n/size*rank;     // inclusive
-    int finish = n/size*(rank+1); // exclusive
-    if (rank == size-1) finish = n;
-
-    MPI_Barrier(MPI_COMM_WORLD);
 
     // if this iteration did not find a new index then don't record anything!
     record = !done;
+ 
     // if this iteration did nothing then the work remains to be computed
     if (!record) --r;
 
-    for (int j=start; j<finish && !done; ++j) {
-      if (pi[j] == 0) { // not already selected
+    // search over problem subdomain for this core
+    for (int j=0; j<n_local && !done; ++j) {
+      int j_global = j+start;
+      if (pi[j_global] == 0) { // not already selected
         for (int jj=0; jj<k; ++jj) {
           space[jj] = 0;
           for (int m=0; m<k; ++m) {
-            double entry = Ainv[jj+k*m];
-            //double diag = i==jj ? -lambda_hat : 0;
-            space[jj] += U[n*m+j]*entry;//(entry+diag);
+            space[jj] += U[n_local*m+j]*Ainv[jj+k*m];
           }
-        }
+        } // ends for over jj
+
         double d = 1.0;
         for (int jj=0; jj<k; ++jj) {
-          d += space[jj]*U[n*jj+j];
+          d += space[jj]*U[n_local*jj+j];
         }
-        for (int ll=0; ll<k; ++ll) { space[ll] = U[n*ll+j]; }
-        char TRANS = 'N';
-        double ONE = 1.0, ZERO = 0.0;
-        int INCX = 1;
-        dgemv_(&TRANS, &k, &k, &ONE, Ainv, &k, &U[j], &n,    &ZERO, space, &INCX);
+        for (int ll=0; ll<k; ++ll) { space[ll] = U[n_local*ll+j]; }
+        char   TRANS = 'N';
+        double ONE   = 1.0, ZERO = 0.0;
+        int    INCX  = 1;
+        dgemv_(&TRANS, &k, &k, &ONE, Ainv, &k, &U[j], &n_local,    &ZERO, space, &INCX);
         double* space2 = new double[k];
+
         for (int pp=0; pp<k; ++pp) { space2[pp] = space[pp]; }
         dgemv_(&TRANS, &k, &k, &ONE, Ainv, &k, space2, &INCX, &ZERO, space, &INCX);
-        delete space2;
+        delete[] space2;
+
         double adj = 0;
-        for (int ii=0; ii<k; ++ii) { adj += U[j+n*ii]*space[ii]; }
+        for (int ii=0; ii<k; ++ii) { adj += U[j+n_local*ii]*space[ii]; }
         adj /= d;
-        
+ 
         // test column j
         if (trhinv-adj <= trinv) {
           for (int prc=0; prc<size; ++prc) {
-            fcol = j;
-            MPI_Send(&fcol, 1, MPI_INT, prc, 1, MPI_COMM_WORLD);
+            // send data
+            for (int i=0; i<k; ++i) u_vec[i] = U[j+n_local*i];
+            u_vec[k] = j_global;
+            MPI_Send(&u_vec[0], k+1, MPI_DOUBLE, prc, 1, MPI_COMM_WORLD);
           }
         }
-      }
+      } // ends not already selected if statement
 
       // test if found
       MPI_Test(&request, &done, &status);
 
     } // end of search loop
 
-    if (!root) {
-      Ainv = NULL;
-      //delete Ainv;
-      space = NULL;
-      //delete space;
-      pi = NULL;
-      //delete pi;
-    }
-
-    MPI_Wait(&request, &status);
     MPI_Barrier(MPI_COMM_WORLD);
+
+    // send column (row in this formulation of U) to update A
+    int find_root = fcol*size/n;
 
     // update A
     if (root) {
@@ -308,21 +334,17 @@ int main(int argc, char* argv[]) {
       if (record) {
         for (int ii=0; ii<k; ++ii) {
           for (int y=0; y<k; ++y) {
-            A[k*y+ii] += U[fcol+n*ii]*U[fcol+n*y];
+            A[k*y+ii] += u_vec[ii] * u_vec[y];
           }
         }
-        pi[fcol] = r+1;
+        pi[int(u_vec[k])] = r+1;
       }
     }
-
-    MPI_Barrier(MPI_COMM_WORLD);
-
   } // end of iteration for loop
+
   if (root) {
-    A = NULL;
-    space = NULL;
-    delete A;
-    delete space;
+    delete[] A;
+    delete[] space;
   }
   // column selection is complete
 
@@ -333,6 +355,7 @@ int main(int argc, char* argv[]) {
       for (int i=0; i<n; ++i) { cout << pi[i] << endl; }
       cout << endl;
     }
+
     pi2 = new int[l];
     convertPi(pi, pi2, n, l);
     if (VERBOSE) {
@@ -351,9 +374,9 @@ int main(int argc, char* argv[]) {
   }
 
   if (root) {
-    delete U;
-    delete pi;
-    delete pi2;
+    delete[] U;
+    delete[] pi;
+    delete[] pi2;
   }
 
   cout <<"Processor " << rank << " has finished" << endl;
@@ -361,8 +384,7 @@ int main(int argc, char* argv[]) {
   // end timer here
   if (root) {
     seconds = read_timer() - seconds;
-    cout << "Computation time: " << seconds << " seconds" << endl;
-    cout << "  on " << size << " cores" << endl;
+    cout << "Computation time: " << seconds << " seconds on " << size << " core(s)" << endl;
   }
 
   MPI_Finalize();
