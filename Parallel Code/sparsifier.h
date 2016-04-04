@@ -1,6 +1,9 @@
 #ifndef _SPARSIFIER_H_
 #define _SPARSIFIER_H_
 
+#include <vector>
+#include <memory>
+
 class sparsifier {
   public:
     // constructor
@@ -19,19 +22,17 @@ class sparsifier {
     // return class member variable T
     double getT();
 
-    // now public:
-
     // lambda is the root of this function
-    static double root1(double x, double* s, int n, int k, double T, int r, double c);
+    static double root1(double x, std::vector<double>& s, int n, int k, double T, int r, double c);
 
     // lambda_hat is the root of this function
-    static double root2(double lh, double* s, int n, int k, double lambda, int r, double c);
+    static double root2(double lh, std::vector<double>& s, int n, int k, double lambda, int r, double c);
 
     // a constant for root2
-    static double root2helper(double* s, int n, int k, double lambda, int r);
+    static double root2helper(std::vector<double>& s, int n, int k, double lambda, int r);
 
     // for the inverse of a small (k-by-k) matrix
-    void inverse(double* A, int N);
+    static void inverse(std::shared_ptr<double> A, int N);
 
   private:
     // calculates problem parameter T
